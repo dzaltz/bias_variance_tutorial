@@ -1,0 +1,501 @@
+---
+title: "Bias vs variance in dietary measurement: a simulation"
+format:
+  gfm:
+    toc: true
+    toc-depth: 3
+execute:
+  message: false
+  warning: false
+knitr:
+  opts_chunk:
+    collapse: true
+    comment: "#>"
+    fig.path: "man/figures/README-"
+    fig.width: 8
+    fig.height: 4.5
+    dpi: 150
+---
+
+## Overview
+
+The purpose of this brief tutorial is to expose students to various important coding concepts in R/RStudio, while also giving an example of the "bias/variance tradeoff" which is a core concept in many introductory statistics courses in graduate school. The tutorial assumes at least a novice background in R coding. It was not designed to be used by students without the guidance and discussion of an advisor, as there are several areas with important caveats and coding techniques that are left out.
+
+To first work through concepts of bias and variance, we will consider two dietary assessment tools which are commonly used in epidemiological studies of nutrition and health: food frequency questionnaires (FFQ) and 24-hour recalls (24HR). Details of these methods and their different applications are beyond the scope of this tutorial. One potential error a student may make in reviewing this tutorial is assuming that one dietary intake method is **better** than another, or that we should just choose one for a specific study. Neither is true. We have different tools for different purposes, and often times the best methods combine information from multiple intake tools. That, too, is beyond the scope of this tutorial, which is primarily focused on bias and variance. [Here is a good resource to start to learn more about dietary assessment](https://epi.grants.cancer.gov/diet/usualintakes/).
+
+In general, the FFQ and 24HR get intake wrong in different ways:
+
+- **FFQ**: high bias, low variance. It asks about intake over a longer period, so day-to-day noise averages out, but it is systematically off.
+- **24HR**: low bias, high variance. On average it is close to the truth, but any single day is a noisy picture of what someone usually eats.
+
+In this tutorial, we simulate data on sodium intake and systolic blood pressure (SBP), where we know the truth, and see what each type of error does to (1) descriptions of intake and (2) the estimated association between sodium and SBP.
+
+Parameters come from Canadian data and published literature where possible. In some places, for purposes of this tutorial, we make up some data to help describe specific concepts. We explicitly state where data comes from.
+
+The tutorial is shown in X sections...
+
+
+## 1. Simulate Data
+
+In a simulation, **we set the truth**. That means we can measure exactly how wrong each tool is, something we can never do with real data.
+
+### 1. setup
+
+Always make sure you have the correct libraries loaded.
+
+```{r}
+#| label: setup
+library(here)
+library(tidyverse)
+```
+
+### 2. PARAMETERS: usual intake
+
+We pull usual sodium intake for Canadian adults from the [Canadian Community Health Survey (CCHS) – Nutrition 2015](https://health.canada.ca/apps/open-information/sodium-potassium/Sodium-usual-intake-Canada-excl-territories-2015-en.csv), published by Health Canada / Statistics Canada. These are *usual* intakes: CCHS used repeat recalls and statistical modelling to strip out day-to-day noise. So the spread in these data reflects **real differences between people**, not measurement error. This will be our "truth".
+
+The data were downloaded from the link above and saved in our `data` folder. We read the saved file. The first line of the file is a title, so we skip it. The file uses Latin-1 encoding, which we specify so special characters display correctly.
+
+```{r}
+#| label: intake-read
+# read CCHS data
+raw_intake <- read_csv(here("data", "sodium_usual_intake_2015.csv"), skip=1, locale = locale(encoding = "latin1"))
+```
+
+Next, we isolate the measurements of interest: Canadian adults (19 years and over), their mean intake, and an SD calculated from the 25th and 75th percentiles (explained below).
+
+```{r}
+#| label: intake-isolate
+# isolate measurements of interest
+intake <- raw_intake |>
+  filter(Country=="Canada") |>  # remove data beyond the estimates (includes footnotes etc)
+  filter(`Age or Life Stage Group` == "19 years and over") |> # only interested in total adult population, not age subgroups
+  transmute(
+    Sex,
+    Mean,
+    sd = (p75-p25) / 1.349 # explain why this number using qnorm(0.75) - qnorm(0.25)
+  )
+```
+
+Let's look at what we have.
+
+```{r}
+#| label: intake-show
+intake
+```
+
+Why 1.349? The table gives percentiles, not an SD. If intake is roughly normal, the distance between the 25th and 75th percentiles is a fixed number of SDs:
+
+```{r}
+#| label: iqr
+qnorm(0.75) - qnorm(0.25)
+```
+
+So SD = (p75 − p25) / 1.349.
+
+Finally, we pull the population mean and SD for both sexes combined. These are the values we will simulate from.
+
+```{r}
+#| label: intake-pull
+# pull population mean (SD)
+mean_sodium <- intake |> filter(Sex=="Both sexes") |> pull(Mean)
+sd_sodium <- intake |> filter(Sex=="Both sexes") |> pull(sd)
+```
+
+Our "truth" is a mean of **`r round(mean_sodium)` mg/day** with an SD of **`r round(sd_sodium)` mg/day**.
+
+```{r}
+#| label: intake-pull-show
+mean_sodium
+sd_sodium
+```
+
+### 3. PARAMETERS: blood pressure
+
+Average SBP among Canadian adults is from [Statistics Canada](https://www150.statcan.gc.ca/n1/pub/82-625-x/2021001/article/00001-eng.htm). We could not easily find a population SD, so we use an [NHANES estimate](https://pmc.ncbi.nlm.nih.gov/articles/PMC10424908/) as a rough guide. Noise in the **outcome** affects **precision** (wider CIs, less power), but it does **not** bias the slope. Noise in the **exposure** is a different story (see below).
+
+```{r}
+#| label: bp
+mean_sbp <- 114 # mmHg
+sd_sbp <- 16 # mmHg
+```
+
+### 4. PARAMETERS: effect of sodium on systolic blood pressure
+
+Here we need data on how sodium impacts SBP. We use a large Cochrane review, [He et al. BMJ 2013;346:f1325](https://www.bmj.com/content/346/bmj.f1325.short). From the abstract:
+
+> "A 100 mmol reduction in 24 hour urinary sodium (6 g/day salt) was associated with a fall in systolic blood pressure of 5.8 mm Hg (2.5 to 9.2, P=0.001) after adjustment for age, ethnic group, and blood pressure status."
+
+Now we have to convert from mmol to mg to align with the CCHS data:
+
+- 1 mmol sodium = 23 mg
+- 100 mmol (what He et al. use) = 2300 mg
+- slope per 1000 mg: (5.8 / 2300) × 1000 = 2.52
+
+This is our target: every tool below is trying to recover this number.
+
+```{r}
+#| label: effect
+effect_sodium_sbp <- 2.52 # mmHg per 1000 mg/day
+```
+
+### 5. PARAMETERS: errors in recall and FFQ data
+
+We rely primarily on [Freedman et al. Am J Epidemiol 2015;181:473–87](https://doi.org/10.1093/aje/kwu325), a pooled analysis of 5 validation studies comparing self-reported sodium against 24-hour urine (a recovery biomarker, our proxy for "truth").
+
+Two tools, two kinds of error. **Bias = how far off on average. Variance = how scattered.**
+
+#### Relative bias
+
+How much of true intake each tool captures, on average (Freedman, discussion p. 483: about 5–10% under-reporting for 24HR, about 30% for FFQ). The recall has a small bias; the FFQ a large one.
+
+```{r}
+#| label: bias
+relative_bias_recall <- 0.925 # 24HR gets about 92% of actual truth
+relative_bias_ffq <- 0.7
+```
+
+#### Recall SD, from the attenuation factor
+
+To get the SD of the recall error, we take the **attenuation factor (AF)**, which is how much an association shrinks when using a recall instead of the "truth", and back-calculate. You can learn more about attenuation [here](https://www.bmj.com/content/340/bmj.c2289.long).
+
+In Freedman (p. 478 & Table 5), the AF for sodium measured with a single 24HR is ~0.2.
+
+```{r}
+#| label: af
+af_recall <- 0.2
+```
+
+Our recall is modelled as:
+
+`recall = relative_bias_recall * truth + error`
+
+Because of the scaling, the AF formula is:
+
+```
+AF = cov(truth, recall) / var(recall)
+   = relative_bias_recall * var(truth) / (relative_bias_recall^2 * var(truth) + var(error))
+```
+
+`var(truth)` is `sd_sodium^2`, so we can solve for `var(error)`:
+
+```
+0.2 = relative_bias_recall * sd_sodium^2 / (relative_bias_recall^2 * sd_sodium^2 + var(error))
+relative_bias_recall^2 * sd_sodium^2 + var(error) = relative_bias_recall * sd_sodium^2 / 0.2
+var(error) = relative_bias_recall * sd_sodium^2 / 0.2 - relative_bias_recall^2 * sd_sodium^2
+```
+
+Note: if `relative_bias_recall = 1` (no proportional bias), this simplifies to `var(error) = sd_sodium^2 / 0.2 - sd_sodium^2`.
+
+Now we calculate it.
+
+```{r}
+#| label: recall-sd
+var_error <- relative_bias_recall * sd_sodium^2 / af_recall - relative_bias_recall^2 * sd_sodium^2
+sd_recall <- sqrt(var_error)
+
+sd_recall
+```
+
+The recall's random error has an SD of **`r round(sd_recall)` mg/day**, about **`r round(sd_recall / sd_sodium, 1)`×** the real differences between people. This is the recall's high variance.
+
+#### FFQ SD (invented)
+
+Finally, we invent a number for the SD of FFQs. In general, FFQs are considered to have lower variance because they ask about foods consumed over a longer period of time, theoretically averaging out day-to-day fluctuations. For the purpose of the activity, we set a low SD to make the lesson clear. In reality this number is probably not as low; Freedman reports an AF of only ~0.1 for sodium FFQs.
+
+```{r}
+#| label: ffq-sd
+sd_ffq <- 200
+```
+
+
+## 2. Simulate Studies
+
+Now that we have our parameters, we can simulate a study.
+
+### 1. residual SD for SBP
+
+SBP = sodium part + residual. Independent parts add on the variance scale, so we set the residual SD to keep total SBP SD at `sd_sbp`:
+
+- `var(SBP) = (effect * sd_sodium/1000)^2 + var(resid)`
+- sodium part SD = `r effect_sodium_sbp` × `r round(sd_sodium)` / 1000 ≈ `r round(effect_sodium_sbp * sd_sodium / 1000, 1)`; total SBP variance = `r sd_sbp`² = `r sd_sbp^2`
+- sd_resid = √(`r sd_sbp^2` − `r round((effect_sodium_sbp * sd_sodium / 1000)^2, 2)`) ≈ `r round(sqrt(sd_sbp^2 - (effect_sodium_sbp * sd_sodium / 1000)^2), 2)`
+
+Sodium explains only **~`r round(100 * (effect_sodium_sbp * sd_sodium / 1000)^2 / sd_sbp^2)`%** of the variation in SBP: a real but small signal, easily buried by measurement error.
+
+```{r}
+#| label: resid
+sd_resid <- sqrt(sd_sbp^2 - (effect_sodium_sbp * sd_sodium / 1000)^2)
+sd_resid
+```
+
+### 2. simulation function
+
+Here we write a function that simulates true intake, SBP, and measured values from recalls and FFQs for `n` people. We set a floor of 0 on the measured values, since intake cannot be negative.
+
+```{r}
+#| label: simulate-function
+simulate_study <- function(n){
+  tibble(
+    truth = rnorm(n, mean_sodium, sd_sodium), # true usual intake
+    sbp = mean_sbp + effect_sodium_sbp*(truth - mean_sodium)/1000 + rnorm(n, 0, sd_resid), # outcome
+    # here we simulate measured values from recalls and ffqs, and we set a floor of 0 (cannot have negative intake)
+    recall = pmax(relative_bias_recall * truth + rnorm(n, 0, sd_recall), 0),
+    ffq = pmax(relative_bias_ffq * truth + rnorm(n, 0, sd_ffq), 0)
+  )
+}
+```
+
+### 3. simulate one study
+
+We set a seed so the results are reproducible, choose a study size, and run the function once.
+
+```{r}
+#| label: simulate-one
+set.seed(12345)
+n <- 1000 # 1000 people in the study, for example
+study <- simulate_study(n)
+```
+
+Each row is one person, with their **true** intake and what a **recall** and an **FFQ** would say.
+
+```{r}
+#| label: simulate-show
+study
+```
+
+
+## 3. Describe Exposures
+
+### 1. summary statistics
+
+We reshape the data so each measure is a group, then summarise each one. `r_truth` is the correlation of each measure with the true intake.
+
+```{r}
+#| label: describe
+study |>
+  pivot_longer(
+    c(truth, recall, ffq),
+    names_to = "measure",
+    values_to = "sodium"
+  ) |>
+  summarise(
+    mean = mean(sodium),
+    sd = sd(sodium),
+    median = median(sodium),
+    p25 = quantile(sodium, 0.25),
+    p75 = quantile(sodium, 0.75),
+    r_truth = cor(sodium, study$truth),
+    .by = measure
+  )
+```
+
+- **Recall:** mean of **`r round(mean(study$recall))`** vs **`r round(mean(study$truth))`** for the truth (`r round(100 * (1 - mean(study$recall) / mean(study$truth)))`% low), but an SD of **`r round(sd(study$recall))`**, about **`r round(sd(study$recall) / sd(study$truth), 1)`×** wider. Correlation with truth: **`r round(cor(study$recall, study$truth), 2)`**.
+- **FFQ:** mean of **`r round(mean(study$ffq))`** (`r round(100 * (1 - mean(study$ffq) / mean(study$truth)))`% low) with an SD of **`r round(sd(study$ffq))`**, *narrower* than the truth. Correlation with truth: **`r round(cor(study$ffq, study$truth), 2)`**.
+
+### 2. distributions
+
+Plotting the distributions makes the difference clear: bias shifts the centre, variance widens the spread. Dashed lines are the means. Note that **narrow ≠ accurate**: the FFQ looks precise partly because its bias squeezes everyone into a smaller range.
+
+```{r}
+#| label: density
+study |>
+  pivot_longer(
+    c(truth, recall, ffq),
+    names_to = "measure",
+    values_to = "sodium"
+  ) |>
+  ggplot(
+    aes(sodium, colour = measure, fill = measure)
+  )+
+  geom_density(alpha = 0.2) +
+  geom_vline(
+    data = \(d) summarise(d, mean = mean(sodium), .by = measure),
+    aes(xintercept = mean, colour = measure),
+    linetype = 2, linewidth = 1,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = "Sodium (mg/day)",
+    title = "Distribution of simulated sodium intake",
+    subtitle = "Bias shifts the centre; variance widens the spread"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA)
+  )
+```
+
+
+## 4. SBP ~ Sodium
+
+Now we regress SBP on sodium using each of the three measures. The true slope is **`r effect_sodium_sbp` mmHg per 1000 mg/day**.
+
+### 1. regression function
+
+This function fits the regression for one measure and returns the slope, its SE, and p-value.
+
+```{r}
+#| label: fit-function
+# regression
+fit_slope <- function(data, measure){
+  x <- data[[measure]]/1000 # mmHg per 1000 mg/day
+  fit <- lm(data$sbp ~ x) # regression, systolic blood pressure and sodium (for each of the three measures)
+  s <- summary(fit)$coefficients[2, ]
+
+  tibble(
+    measure,
+    est = s[[1]],
+    se = s[[2]],
+    p = s[[4]]
+  )
+}
+```
+
+### 2. estimate the association, one study
+
+We apply the function to each measure in our single study and add 95% CIs.
+
+```{r}
+#| label: fit-results
+# results
+map_dfr(c("truth", "recall", "ffq"), \(m) fit_slope(study, m)) |>
+  mutate(lo = est-1.96*se, hi = est+1.96*se)
+```
+
+```{r}
+#| label: fit-values
+#| include: false
+one <- map_dfr(c("truth", "recall", "ffq"), \(m) fit_slope(study, m))
+est1 <- \(m) round(one$est[one$measure == m], 2)
+```
+
+Same people, same blood pressures, three answers:
+
+- **Truth:** `r est1("truth")`. Even the truth misses in a single study; that's ordinary sampling variation, and why we repeat the study below.
+- **Recall:** **`r est1("recall")`**, shrunk toward zero. Random error in the exposure *flattens* the association (attenuation).
+- **FFQ:** **`r est1("ffq")`**, too steep. The FFQ squeezes intake into a smaller range, so the same rise in SBP is spread over fewer mg.
+
+### 3. visualize the fitted lines
+
+```{r}
+#| label: fit-plot
+#| fig-height: 4
+# visualize lm line
+study |>
+  pivot_longer(c(truth, recall, ffq), names_to = "measure", values_to = "sodium") |>
+  ggplot(aes(sodium, sbp)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm") +
+  facet_wrap(~measure, scales = "free_x") +
+  labs(
+    x = "Sodium (mg/day)",
+    y = "SBP (mmHg)",
+    title = "Fitted lines, SBP~sodium"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.border = element_rect(colour = "black", fill=NA)
+  )
+```
+
+### 4. repeat the study many times
+
+One study can mislead, so we repeat the whole study many times and look at how the estimated slope behaves for each tool. First, we set the number of simulated studies.
+
+```{r}
+#| label: n-sims
+n_sims <- 500
+```
+
+Then we simulate a new study and estimate the slope for each measure, `n_sims` times.
+
+```{r}
+#| label: sims
+sims <- map_dfr(1:n_sims, \(i){
+  d <- simulate_study(n)
+  map_dfr(c("truth", "recall", "ffq"), \(m) fit_slope(d, m)) |> mutate(sim = i)
+})
+```
+
+### 5. summarise across studies
+
+For each measure we calculate:
+
+- **bias**: systematic error in the slope
+- **emp_se**: spread of the slope across studies
+- **rmse**: bias and variance combined
+- **coverage**: % of 95% CIs containing the truth
+- **power**: % of studies detecting the effect
+
+```{r}
+#| label: sims-summary
+sims |>
+  group_by(measure) |>
+  summarise(
+    mean_est = mean(est),
+    bias = mean(est) - effect_sodium_sbp, # systematic error in the slope
+    emp_se = sd(est), # spread of the slope across studies
+    rmse     = sqrt(mean((est - effect_sodium_sbp)^2)), # bias and variance combined
+    coverage = mean(abs(est - effect_sodium_sbp) <= 1.96 * se),  # % of 95% CIs containing the truth
+    power    = mean(p < 0.05) # % of studies detecting the effect
+  )
+```
+
+```{r}
+#| label: sims-values
+#| include: false
+s <- sims |>
+  summarise(
+    mean_est = mean(est),
+    coverage = mean(abs(est - effect_sodium_sbp) <= 1.96 * se),
+    power = mean(p < 0.05),
+    .by = measure
+  )
+get <- \(m, col) s[[col]][s$measure == m]
+```
+
+Across **`r n_sims`** simulated studies:
+
+- **Recall (low bias, high variance):** average slope **`r round(get("recall", "mean_est"), 2)`**, about **`r round(100 * get("recall", "mean_est") / effect_sodium_sbp)`%** of the truth, matching the attenuation factor of `r af_recall`. Its CIs contain the truth **`r round(100 * get("recall", "coverage"))`%** of the time, and only **`r round(100 * get("recall", "power"))`%** of studies detect the effect.
+- **FFQ (high bias, low variance):** average slope **`r round(get("ffq", "mean_est"), 2)`**, about **`r round(100 * (get("ffq", "mean_est") / effect_sodium_sbp - 1))`% too high**. CI coverage **`r round(100 * get("ffq", "coverage"))`%**.
+
+### 6. visualize the sampling distribution
+
+The red line is the true slope. **Neither error is harmless, and they push the slope in opposite directions.** A bigger study shrinks the spread of the estimates, but not the bias.
+
+```{r}
+#| label: sims-plot
+#| fig-height: 3.5
+sims |>
+  ggplot(
+    aes(measure, est, fill = measure)
+  ) +
+  geom_boxplot() +
+  geom_hline(yintercept = effect_sodium_sbp, linetype = 2, colour = "red") +
+  labs(
+    y = "Estimated slope (mmHg per 1000 mg/day)",
+    title = "Sampling distribution of the slope by measurement tool"
+  ) +
+  coord_flip()+
+  theme_minimal() +
+  theme(
+    panel.border = element_rect(colour = "black", fill=NA)
+  )
+```
+
+
+## Sources
+
+| Parameter | Value | Source |
+|---|---|---|
+| `mean_sodium`, `sd_sodium` | `r round(mean_sodium)`, `r round(sd_sodium)` mg/day | [CCHS – Nutrition 2015, usual sodium intake](https://health.canada.ca/apps/open-information/sodium-potassium/Sodium-usual-intake-Canada-excl-territories-2015-en.csv) (19 years and over, both sexes) |
+| `mean_sbp` | `r mean_sbp` mmHg | [Statistics Canada](https://www150.statcan.gc.ca/n1/pub/82-625-x/2021001/article/00001-eng.htm) |
+| `sd_sbp` | `r sd_sbp` mmHg | [NHANES estimate](https://pmc.ncbi.nlm.nih.gov/articles/PMC10424908/) |
+| `effect_sodium_sbp` | `r effect_sodium_sbp` mmHg per 1000 mg/day | [He et al. BMJ 2013](https://www.bmj.com/content/346/bmj.f1325.short), abstract (converted from per 100 mmol) |
+| `relative_bias_recall`, `relative_bias_ffq` | `r relative_bias_recall`, `r relative_bias_ffq` | [Freedman et al. 2015](https://doi.org/10.1093/aje/kwu325), p. 483 |
+| `af_recall` | `r af_recall` (gives `sd_recall` = `r round(sd_recall)` mg/day) | [Freedman et al. 2015](https://doi.org/10.1093/aje/kwu325), p. 478 & Table 5; background on attenuation: [Hutcheon et al. BMJ 2010](https://www.bmj.com/content/340/bmj.c2289.long) |
+| `sd_ffq` | `r sd_ffq` mg/day | invented for teaching |
